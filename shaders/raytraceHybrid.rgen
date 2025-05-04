@@ -1,0 +1,303 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_ARB_shader_clock : enable
+
+#include "raycommon.glsl"
+#include "host_device.h"
+#include "random.glsl"
+#include "gltf.glsl"
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+layout(location = 1) rayPayloadEXT shadowPayload prdShadow;
+
+layout(binding = eTlas, set = 1) uniform accelerationStructureEXT topLevelAS;
+layout(binding = eOutImage, set = 1, rgba32f) uniform image2D image;
+layout(binding = ePosMap, set = 1, rgba32f) uniform image2D imagePos;
+layout(binding = eNormMap, set = 1, rgba32f) uniform image2D imageNorm;
+layout(binding = eAccumMap, set = 1, rgba32f) uniform image2D imageAccum;
+layout(binding = eRoughMap, set = 1, rg16f) uniform image2D roughMap;
+
+layout(binding = eInMV, set = 1, rgba16f) uniform image2D o_motionVector;
+layout(binding = eInNormRough, set = 1, rgb10_a2) uniform image2D o_normalRoughness;
+layout(binding = eInViewZ, set = 1, r16f) uniform image2D o_viewZ;
+layout(binding = eInRadHitD, set = 1, rgba16f) uniform image2D o_diffRadianceHitD;
+
+layout(binding = eGlobals, set = 0) uniform _GlobalUniform { GlobalUniforms uni; };
+
+#include "common_layouts.glsl"
+
+const int AOSAMPLES = 4;
+float rtao_radius = 2.0f;       // Length of the ray
+float rtao_power = 2.0f;        // Darkness is stronger for more hits
+//int   rtao_distance_based{1};  // Attenuate based on distance
+
+void accumulateFrames(vec4 color, ivec2 XY)
+{
+    if (pcRay.frame > 0)
+    {
+        float a         = 1.0 / float(pcRay.frame + 1);
+        vec4  old_color = imageLoad(imageAccum, XY);
+        imageStore(imageAccum, XY, mix(old_color, color, a));
+    }
+    else
+    {
+        imageStore(imageAccum, XY, color);//vec4(1.0f - ao));
+    }
+}
+
+void main() 
+{  
+    //imageStore(imageAccum, ivec2(gl_LaunchIDEXT), vec4(vec3(normRR.w), 1.0f));
+    //imageStore(imageAccum, ivec2(gl_LaunchIDEXT), imageLoad(o_viewZ, ivec2(gl_LaunchIDEXT)));
+    //return;
+    prd.seed = tea(gl_LaunchIDEXT.y * gl_LaunchIDEXT.x + gl_LaunchIDEXT.x, int(clockARB()));
+    ivec2 XY = ivec2(gl_LaunchIDEXT);
+    vec4 color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    vec4 pixelImg  = imageLoad(image, XY);
+    vec4 pixelPos  = imageLoad(imagePos, XY);
+    vec4 pixelNorm = imageLoad(imageNorm, XY);
+    vec2 roughMetallic = imageLoad(roughMap, XY).rg;
+    
+    vec3 worldPos = pixelPos.xyz;
+    vec3 worldNrm = pixelNorm.xyz;
+
+    // Check if we actually shaded this pixel
+    if (worldPos == vec3(0.0f) && worldNrm == vec3(0.0f))
+    {
+        accumulateFrames(color, XY);
+        return;
+    }
+
+    // Use w components that remained unused to encode albedo
+    vec3 albedo = vec3(pixelImg.w, pixelPos.w, pixelNorm.w);
+    float roughness = roughMetallic.r;
+    float metalness = roughMetallic.g;
+
+    uint rayMissFlags  = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT;
+
+    // Direct shadows
+    if (pcRay.useShadows == 1)
+    {
+        GltfLights lights = GltfLights(sceneDesc.lightAddress);
+        float visibility = 1.0f;
+        float weightShadow = 1.0f / pcRay.lightsCount;
+        vec3 L;
+        int random_index = int(rnd(prd.seed) * float(pcRay.lightsCount));    // TODO: check possiblity of out of bounds index
+        GltfLight light = lights.l[random_index];
+
+        //for (int i = 0; i < pcRay.lightsCount; i++)
+        //{
+        //    GltfLight light = lights.l[i];
+            vec3 lightDir = light.position - worldPos;
+            float lightDistance = length(lightDir);
+            L = normalize(lightDir);
+            if (dot(L, worldNrm) < 0.0f)        
+            {
+                //visibility -= weightShadow;
+                visibility = 0.0f;
+                //continue;
+            }
+            else
+            {
+                float tMin   = 0.1f;
+                float tMax   = lightDistance - tMin;
+                vec3  shadowRayDir =  L;
+                
+                prdShadow.isHit = true;
+                traceRayEXT(topLevelAS,
+                    rayMissFlags,
+                    0xFF,
+                    0,
+                    0,
+                    1,
+                    worldPos,
+                    tMin,
+                    shadowRayDir,
+                    tMax,
+                    1
+                );
+
+                if (prdShadow.isHit)
+                    visibility = 0.0f;
+            //{
+            //    visibility -= weightShadow;
+            //}
+            }
+        //}
+        visibility = max(visibility, 0.01f);
+        color.a *= visibility;
+    }
+
+    // Ambient Occlusion
+    if (pcRay.useAO == 1)
+    {
+        float ao = 0.0f;
+        vec3 tangent, binormal;
+        createCoordinateSystem(worldNrm, tangent, binormal);
+        float weightAo = 1.0f / AOSAMPLES;
+        for (int i = 0; i < AOSAMPLES; i++)
+        {
+            // Do not take into account distance from hit point
+            //uint  flags  = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT;
+
+            float tMin = 0.1f;
+            float tMax = rtao_radius;
+            vec3 rayDir = normalize(samplingHemisphere(prd.seed, tangent, binormal, worldNrm));
+
+            prdShadow.isHit = true;
+            traceRayEXT(topLevelAS,
+                rayMissFlags,
+                0xFF,
+                0,
+                0,
+                1,
+                worldPos,
+                tMin,
+                rayDir,
+                tMax,
+                1
+            );
+
+            if (prdShadow.isHit)
+            {
+                ao += weightAo;
+            }
+        }
+        color.a *= (1.0f - ao);
+    }
+
+    vec4 indirectColor = vec4(0.0f);
+    if (pcRay.useGI == 1 /*&& !(worldPos == vec3(0.0f) && worldNrm == vec3(0.0f))*/)
+    {
+        float hitDists = 0.0f;
+        vec3 hitValues = vec3(0);
+        vec3 origin    = worldPos; 
+        uint rayFlags  = gl_RayFlagsOpaqueEXT;
+
+        float tMin     = 0.001;
+        float tMax     = 10000.0;
+
+        vec3 direction;
+        //float ratio = 0.5f * (1.0f - metalness);
+        float ratio = metalness * (1.0f - roughness);
+        vec3 curWeight;// vec3(1);// 
+
+        if (ratio < 0.8f)
+        {
+            prd.isSpecular = false;
+            vec3 tangent, binormal;
+            createCoordinateSystem(worldNrm, tangent, binormal);
+            direction = normalize(samplingHemisphere(prd.seed, tangent, binormal, worldNrm));
+            curWeight = albedo;
+        }
+        else
+        {
+            prd.isSpecular = true;
+            vec4 camera = uni.viewInverse * vec4(0, 0, 0, 1);
+            vec3 V = normalize(vec3(camera) - origin);
+            direction = normalize(reflect(-V, worldNrm));
+            curWeight = vec3(1);
+        }
+        prd.hitValue     = vec3(0);
+        prd.rayOrigin    = origin.xyz;
+        prd.rayDirection = direction.xyz;
+        prd.depth        = 1;
+        prd.weight       = vec3(0);
+        
+        vec3 hitValue  = vec3(0);
+
+        for (; prd.depth < pcRay.depth; prd.depth++)
+        {
+            traceRayEXT(topLevelAS,
+                rayFlags,
+                0xFF,
+                0,
+                0,
+                0,
+                prd.rayOrigin,
+                tMin,
+                prd.rayDirection,
+                tMax,
+                0
+            );
+
+            prdShadow.isHit = false;
+            // Shadow ray hit
+            if (!prd.isSpecular && prd.depth != 100)
+            {
+                prdShadow.isHit = true;
+                //float tMin   = 0.1f;
+                //float tMax   = lightDistance - tMin;
+                //vec3  shadowRayDir =  L;
+                traceRayEXT(topLevelAS,
+                    rayMissFlags,
+                    0xFF,
+                    0,
+                    0,
+                    1,
+                    prd.rayOrigin,
+                    tMin,
+                    prd.shadowRayDir,
+                    prd.lightDist - 0.1f,
+                    1
+                );
+            }
+
+            if (!prdShadow.isHit)
+            {
+                hitValue += min(prd.hitValue * curWeight, 10.0f);
+                
+            }
+            if (prd.depth == 1 && !prd.isSpecular)
+            {
+                if (!prdShadow.isHit)
+                {
+                    hitDists = prd.lightDist;
+                }
+                else
+                {
+                    // TODO: actual hit distance
+                    hitDists = 0.5 * prd.lightDist;
+                }
+            }
+            curWeight *= prd.weight;
+        }
+
+        hitValues += hitValue;
+
+        indirectColor = vec4(hitValues, 1.0f);
+        color.rgb = indirectColor.rgb;
+
+        // Denoiser
+        float viewZ = imageLoad(o_viewZ, XY).r;
+        // TODO: don't use hardcoded values
+        vec4 hitDistParams = vec4(3.0f, 1.0f, 20.0f, -25.0f);
+        float normHitDist = REBLUR_FrontEnd_GetNormHitDist(hitDists, viewZ, hitDistParams, roughness);
+        vec4 packed = REBLUR_FrontEnd_PackRadianceAndNormHitDist(hitValues, normHitDist, true);
+        //vec4 unpacked = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(packed);
+        
+        imageStore(o_diffRadianceHitD, XY, packed);
+    }
+
+    // Store the accumulated image
+    accumulateFrames(color, XY);
+    
+    // Mix with rasterized image, moved to post shader to decouple mixing from ray tracing
+
+    /*vec4 outputColor = imageLoad(imageAccum, XY);
+    if (pcRay.viewAccumulated == 0)
+    {
+        outputColor = vec4(imageLoad(image, XY).rgb * outputColor.a + outputColor.rgb, 1.0f);
+    }
+    else
+    {
+        if (pcRay.useGI == 0)
+        {
+            outputColor.rgb = vec3(outputColor.a);
+        }
+    }
+
+    imageStore(image, XY, outputColor);*/
+}

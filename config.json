@@ -1,0 +1,12 @@
+{
+    "scenes" : [
+        "media/scenes/Sponza.gltf",
+        "media/scenes/fireplace/fireplace.gltf",
+        "media/scenes/cornell.gltf",
+        "media/scenes/suntemple/suntemple.gltf"
+    ],
+    "scene": 2,
+    "vsync": false,
+    "width": 1280,
+    "height": 720
+}

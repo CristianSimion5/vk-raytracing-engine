@@ -1,0 +1,16 @@
+/spv/*
+/build/*
+.vs/
+*/_autogen/
+.obsidian/
+_Install/
+/NRI2
+/_NRD_SDK
+/_NRI_SDK
+
+# Leaver Cornell Box
+/media/*
+/media/scenes/*
+!/media/scenes
+!/media/scenes/cornell.gltf
+!/media/scenes/cornell.bin

@@ -1,0 +1,146 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_ARB_shader_clock : enable
+
+#include "raycommon.glsl"
+#include "random.glsl"
+#include "host_device.h"
+#include "gltf.glsl"
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+layout(location = 1) rayPayloadEXT shadowPayload prdShadow;
+
+layout(binding = eTlas, set = 1) uniform accelerationStructureEXT topLevelAS;
+layout(binding = eOutImage, set = 1, rgba32f) uniform image2D image;
+
+//layout(binding = eInNormRough, set = 1, rgb10_a2) uniform image2D o_normalRoughness;
+//layout(binding = eInViewZ, set = 1, r16f) uniform image2D o_viewZ;
+//layout(binding = eInRadHitD, set = 1, rgba16f) uniform image2D o_diffRadianceHitD;
+
+layout(binding = eGlobals, set = 0) uniform _GlobalUniform { GlobalUniforms uni; };
+
+void main() 
+{
+    // imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(0.5, 0.5, 0.5, 1.0));
+    prd.seed = tea(gl_LaunchIDEXT.y * gl_LaunchIDEXT.x + gl_LaunchIDEXT.x, int(clockARB()));
+    
+    vec3 hitValues = vec3(0);
+    vec4 origin    = uni.viewInverse * vec4(0, 0, 0, 1);
+
+    uint rayFlags      = gl_RayFlagsOpaqueEXT;//gl_RayFlagsNoneEXT;
+    uint rayMissFlags  = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | 
+        gl_RayFlagsSkipClosestHitShaderEXT;
+    
+    float tMin     = 0.001;
+    float tMax     = 10000.0;
+
+    float hitDists = 0.0f;
+    for(int smpl = 0; smpl < pcRay.samples; smpl++)
+    {
+        float r1 = rnd(prd.seed);
+        float r2 = rnd(prd.seed);
+        vec2 subpixel_jitter = pcRay.frame == 0? vec2(0.5) : vec2(r1, r2);
+
+        const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + subpixel_jitter;
+        const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+        vec2 d = inUV * 2.0 - 1.0;
+
+        vec4 target    = uni.projInverse * vec4(d.x, d.y, 1, 1);
+        vec4 direction = uni.viewInverse * vec4(normalize(target.xyz), 0);
+
+        prd.hitValue     = vec3(0);
+        prd.rayOrigin    = origin.xyz;
+        prd.rayDirection = direction.xyz;
+        prd.depth        = 0;
+        prd.weight       = vec3(0);
+        
+        vec3 curWeight = vec3(1);
+        vec3 hitValue  = vec3(0);
+
+        for (; prd.depth < pcRay.depth; prd.depth++)
+        {
+            traceRayEXT(topLevelAS,
+                rayFlags,
+                0xFF,
+                0,
+                0,
+                0,
+                prd.rayOrigin,
+                tMin,
+                prd.rayDirection,
+                tMax,
+                0
+            );
+
+            prdShadow.isHit = false;
+            // Shadow ray hit
+            if (!prd.isSpecular && prd.depth != 100)
+            {
+                prdShadow.isHit = true;
+                //float tMin   = 0.1f;
+                //float tMax   = lightDistance - tMin;
+                //vec3  shadowRayDir =  L;
+                traceRayEXT(topLevelAS,
+                    rayMissFlags,
+                    0xFF,
+                    0,
+                    0,
+                    1,
+                    prd.rayOrigin,
+                    tMin,
+                    prd.shadowRayDir,
+                    prd.lightDist - 0.1f,
+                    1
+                );
+            }
+
+            if (!prdShadow.isHit)
+            {
+              hitValue += min(prd.hitValue * curWeight, 10.0f);
+            }
+            if (prd.depth == 1 && !prd.isSpecular)
+            {
+                if (!prdShadow.isHit)
+                {
+                    hitDists += prd.lightDist / pcRay.samples;
+                }
+                else
+                {
+                    // TODO: actual hit distance
+                    hitDists += 0.5 * prd.lightDist / pcRay.samples;
+                }
+            }
+            curWeight *= prd.weight;
+        }
+
+        hitValues += hitValue;
+    }
+    prd.hitValue = hitValues / pcRay.samples;
+
+    /* Modificari: trebuie 1st bounce visibility test ca daca e luat din rasterizare nu se updateaza
+    float roughness, materialID;
+    vec4 normRough = imageLoad(o_normalRoughness, ivec2(gl_LaunchIDEXT.xy));
+    roughness = NRD_FrontEnd_UnpackNormalAndRoughness(normRough, materialID);
+    // Denoiser
+    float viewZ = imageLoad(o_viewZ, ivec2(gl_LaunchIDEXT.xy)).r;
+    // TODO: don't use hardcoded values
+    vec4 hitDistParams = vec4(3.0f, 1.0f, 20.0f, -25.0f);
+    float normHitDist = REBLUR_FrontEnd_GetNormHitDist(hitDists, viewZ, hitDistParams, roughness);
+    vec4 packed = REBLUR_FrontEnd_PackRadianceAndNormHitDist(prd.hitValue, normHitDist, true);
+    //vec4 unpacked = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(packed);
+    imageStore(o_diffRadianceHitD, ivec2(gl_LaunchIDEXT.xy), packed);
+    */
+
+    if (pcRay.frame > 0)
+    {
+        float a         = 1.0 / float(pcRay.frame + 1);
+        vec3  old_color = imageLoad(image, ivec2(gl_LaunchIDEXT.xy)).xyz;
+        imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(mix(old_color, prd.hitValue, a), 1.0));
+    }
+    else
+    {
+        imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(prd.hitValue, 1.0));
+    }
+}
