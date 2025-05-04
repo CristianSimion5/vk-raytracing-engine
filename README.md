@@ -10,8 +10,27 @@ Implemented in C++ using the cross-platform graphics API Vulkan, which provides 
 - Load GLTF Scenes/Models (only one provided in this repository)
 - PBR lighting model
 
+Video demo available [here](https://www.youtube.com/watch?v=GOE2hB0tYWQ)
+
+## Configuration
+Some settings can be configured using the `config.json` file:
+```json
+{
+    "scenes" : [
+        "media/scenes/Sponza.gltf",
+        "media/scenes/fireplace/fireplace.gltf",
+        "media/scenes/cornell.gltf",
+        "media/scenes/suntemple/suntemple.gltf"
+    ],
+    "scene": 2,
+    "vsync": false,
+    "width": 1280,
+    "height": 720
+}
+```
+
 ## Dependencies
-- [nvpro-core](https://github.com/nvpro-samples/nvpro_core): Shared source code used for various [Nvidia Samples](https://github.com/nvpro-samples). Used in this project as a thin framework which provides wrappers and helpers for various APIs (including Vulkan and other graphics APIs) to reduce verbosity. Also contains window management and UI functionality. nvpro-core uses the following projects:
+- [nvpro-core](https://github.com/nvpro-samples/nvpro_core): Shared source code used for various [NVIDIA Samples](https://github.com/nvpro-samples). Used in this project as a thin framework which provides wrappers and helpers for various APIs (including Vulkan and other graphics APIs) to reduce verbosity. Also contains window management and UI functionality. nvpro-core uses the following projects:
     - GLFW: cross-platform windowing
     - GLM: mathematics library
     - Dear ImGUI: User Interface
